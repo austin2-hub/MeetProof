@@ -194,3 +194,56 @@
         (asserts! (is-eq tx-sender sender) ERR-NOT-AUTHORIZED)
         (asserts! (is-some (nft-get-owner? meetproof-nft token-id)) ERR-NFT-NOT-FOUND)
         (nft-transfer? meetproof-nft token-id sender recipient)))
+
+
+;; read only functions
+
+;; Get session details
+(define-read-only (get-session (session-id uint))
+    (map-get? sessions session-id))
+
+;; Get NFT metadata
+(define-read-only (get-nft-metadata (nft-id uint))
+    (map-get? nft-metadata nft-id))
+
+;; Verify meeting authenticity
+(define-read-only (verify-meeting (nft-id uint))
+    (let ((metadata (unwrap! (map-get? nft-metadata nft-id) ERR-NFT-NOT-FOUND))
+          (session (unwrap! (map-get? sessions (get session-id metadata)) ERR-SESSION-NOT-FOUND)))
+        (ok {
+            valid: true,
+            session-id: (get session-id metadata),
+            timestamp: (get timestamp metadata),
+            location: (get location metadata),
+            participants: (get participants metadata),
+            verified-at-block: (get block-height metadata)
+        })))
+
+;; Get participant's sessions
+(define-read-only (get-participant-sessions (participant principal))
+    (default-to (list) (map-get? participant-sessions participant)))
+
+;; Get current session counter
+(define-read-only (get-session-counter)
+    (var-get session-counter))
+
+;; Get current NFT counter
+(define-read-only (get-nft-counter)
+    (var-get nft-counter))
+
+;; Check if contract is paused
+(define-read-only (is-contract-paused)
+    (var-get contract-paused))
+
+;; NFT trait functions
+(define-read-only (get-last-token-id)
+    (ok (var-get nft-counter)))
+
+(define-read-only (get-token-uri (token-id uint))
+    (let ((metadata (map-get? nft-metadata token-id)))
+        (match metadata
+            meta (ok (get metadata-uri meta))
+            (ok none))))
+
+(define-read-only (get-owner (token-id uint))
+    (ok (nft-get-owner? meetproof-nft token-id)))
