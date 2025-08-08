@@ -68,3 +68,129 @@
 
 (define-map participant-sessions principal (list 100 uint))
 (define-map session-participants uint (list 50 principal))
+
+
+
+;; public functions
+
+;; Create a new meeting session
+(define-public (create-session 
+                (secret (buff 6)) 
+                (location {lat: int, lon: int}) 
+                (radius uint) 
+                (duration uint)
+                (min-participants uint)
+                (max-participants uint))
+    (let ((session-id (+ (var-get session-counter) u1)))
+        ;; Validate inputs
+        (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= radius MIN-RADIUS) (<= radius MAX-RADIUS)) ERR-INVALID-RADIUS)
+        (asserts! (and (>= duration MIN-DURATION) (<= duration MAX-DURATION)) ERR-INVALID-DURATION)
+        (asserts! (and (>= min-participants u2) (<= min-participants max-participants)) ERR-MIN-PARTICIPANTS-NOT-MET)
+        (asserts! (<= max-participants MAX-PARTICIPANTS) ERR-MIN-PARTICIPANTS-NOT-MET)
+        (asserts! (and (>= (get lat location) -90000000) (<= (get lat location) 90000000)) ERR-INVALID-LOCATION)
+        (asserts! (and (>= (get lon location) -180000000) (<= (get lon location) 180000000)) ERR-INVALID-LOCATION)
+        
+        ;; Create session
+        (map-set sessions session-id {
+            initiator: tx-sender,
+            secret-hash: (sha256 secret),
+            location: location,
+            radius: radius,
+            start-block: block-height,
+            end-block: (+ block-height duration),
+            min-participants: min-participants,
+            max-participants: max-participants,
+            participants: (list),
+            nft-minted: false,
+            metadata-uri: none
+        })
+        
+        ;; Update counter
+        (var-set session-counter session-id)
+        
+        ;; Add to initiator's sessions
+        (update-participant-sessions tx-sender session-id)
+        
+        (ok session-id)))
+
+;; Verify participation in a meeting session
+(define-public (verify-participation 
+               (session-id uint) 
+               (secret (buff 6)) 
+               (location {lat: int, lon: int}))
+    (let ((session (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND))
+          (current-participants (get participants session)))
+        
+        ;; Validate session and participation
+        (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+        (asserts! (>= block-height (get start-block session)) ERR-SESSION-NOT-STARTED)
+        (asserts! (<= block-height (get end-block session)) ERR-SESSION-EXPIRED)
+        (asserts! (is-eq (sha256 secret) (get secret-hash session)) ERR-INVALID-SECRET)
+        (asserts! (is-valid-location? (get location session) location (get radius session)) ERR-INVALID-LOCATION)
+        (asserts! (is-none (index-of current-participants tx-sender)) ERR-ALREADY-PARTICIPATED)
+        (asserts! (< (len current-participants) (get max-participants session)) ERR-MIN-PARTICIPANTS-NOT-MET)
+        
+        ;; Add participant to session
+        (let ((new-participants (unwrap! (as-max-len? (append current-participants tx-sender) u50) ERR-MIN-PARTICIPANTS-NOT-MET)))
+            (map-set sessions session-id 
+                (merge session { participants: new-participants }))
+            
+            ;; Update participant's session list
+            (update-participant-sessions tx-sender session-id)
+            
+            ;; Try to mint NFT if conditions are met
+            (try! (maybe-mint-nft session-id))
+            
+            (ok true))))
+
+;; Mint NFT when minimum participants reached
+(define-public (mint-meeting-nft (session-id uint))
+    (let ((session (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND))
+          (participants (get participants session)))
+        
+        ;; Validate minting conditions
+        (asserts! (not (get nft-minted session)) ERR-NFT-ALREADY-MINTED)
+        (asserts! (>= (len participants) (get min-participants session)) ERR-MIN-PARTICIPANTS-NOT-MET)
+        (asserts! (> block-height (get end-block session)) ERR-SESSION-NOT-STARTED) ;; Session must be ended
+        
+        ;; Mint NFT
+        (let ((nft-id (+ (var-get nft-counter) u1)))
+            (var-set nft-counter nft-id)
+            
+            ;; Store NFT metadata
+            (map-set nft-metadata nft-id {
+                timestamp: (unwrap! (get-block-info? time (get end-block session)) ERR-SESSION-NOT-FOUND),
+                block-height: (get end-block session),
+                location: (get location session),
+                participants: participants,
+                session-id: session-id,
+                metadata-uri: (get metadata-uri session)
+            })
+            
+            ;; Mark session as minted
+            (map-set sessions session-id (merge session { nft-minted: true }))
+            
+            ;; Mint NFTs to all participants
+            (fold mint-to-participant participants (ok nft-id)))))
+
+;; Set metadata URI for a session (only initiator)
+(define-public (set-session-metadata-uri (session-id uint) (metadata-uri (string-utf8 200)))
+    (let ((session (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get initiator session)) ERR-NOT-AUTHORIZED)
+        (map-set sessions session-id (merge session { metadata-uri: (some metadata-uri) }))
+        (ok true)))
+
+;; Emergency pause/unpause (contract owner only)
+(define-public (set-contract-paused (paused bool))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set contract-paused paused)
+        (ok true)))
+
+;; NFT transfer function
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (nft-get-owner? meetproof-nft token-id)) ERR-NFT-NOT-FOUND)
+        (nft-transfer? meetproof-nft token-id sender recipient)))
