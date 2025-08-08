@@ -7,8 +7,8 @@
 ;;              receive NFTs as permanent proof of attendance.
 
 ;; traits
-(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
-(use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+;; (impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+;; (use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
 
 ;; token definitions
 (define-non-fungible-token meetproof-nft uint)
@@ -97,8 +97,8 @@
             secret-hash: (sha256 secret),
             location: location,
             radius: radius,
-            start-block: block-height,
-            end-block: (+ block-height duration),
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height duration),
             min-participants: min-participants,
             max-participants: max-participants,
             participants: (list),
@@ -124,8 +124,8 @@
         
         ;; Validate session and participation
         (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
-        (asserts! (>= block-height (get start-block session)) ERR-SESSION-NOT-STARTED)
-        (asserts! (<= block-height (get end-block session)) ERR-SESSION-EXPIRED)
+        (asserts! (>= stacks-block-height (get start-block session)) ERR-SESSION-NOT-STARTED)
+        (asserts! (<= stacks-block-height (get end-block session)) ERR-SESSION-EXPIRED)
         (asserts! (is-eq (sha256 secret) (get secret-hash session)) ERR-INVALID-SECRET)
         (asserts! (is-valid-location? (get location session) location (get radius session)) ERR-INVALID-LOCATION)
         (asserts! (is-none (index-of current-participants tx-sender)) ERR-ALREADY-PARTICIPATED)
@@ -152,7 +152,7 @@
         ;; Validate minting conditions
         (asserts! (not (get nft-minted session)) ERR-NFT-ALREADY-MINTED)
         (asserts! (>= (len participants) (get min-participants session)) ERR-MIN-PARTICIPANTS-NOT-MET)
-        (asserts! (> block-height (get end-block session)) ERR-SESSION-NOT-STARTED) ;; Session must be ended
+        (asserts! (> stacks-block-height (get end-block session)) ERR-SESSION-NOT-STARTED) ;; Session must be ended
         
         ;; Mint NFT
         (let ((nft-id (+ (var-get nft-counter) u1)))
@@ -160,7 +160,7 @@
             
             ;; Store NFT metadata
             (map-set nft-metadata nft-id {
-                timestamp: (unwrap! (get-block-info? time (get end-block session)) ERR-SESSION-NOT-FOUND),
+                timestamp: stacks-block-height,
                 block-height: (get end-block session),
                 location: (get location session),
                 participants: participants,
@@ -194,3 +194,108 @@
         (asserts! (is-eq tx-sender sender) ERR-NOT-AUTHORIZED)
         (asserts! (is-some (nft-get-owner? meetproof-nft token-id)) ERR-NFT-NOT-FOUND)
         (nft-transfer? meetproof-nft token-id sender recipient)))
+
+
+;; read only functions
+
+;; Get session details
+(define-read-only (get-session (session-id uint))
+    (map-get? sessions session-id))
+
+;; Get NFT metadata
+(define-read-only (get-nft-metadata (nft-id uint))
+    (map-get? nft-metadata nft-id))
+
+;; Verify meeting authenticity
+(define-read-only (verify-meeting (nft-id uint))
+    (let ((metadata (unwrap! (map-get? nft-metadata nft-id) ERR-NFT-NOT-FOUND))
+          (session (unwrap! (map-get? sessions (get session-id metadata)) ERR-SESSION-NOT-FOUND)))
+        (ok {
+            valid: true,
+            session-id: (get session-id metadata),
+            timestamp: (get timestamp metadata),
+            location: (get location metadata),
+            participants: (get participants metadata),
+            verified-at-block: (get block-height metadata)
+        })))
+
+;; Get participant's sessions
+(define-read-only (get-participant-sessions (participant principal))
+    (default-to (list) (map-get? participant-sessions participant)))
+
+;; Get current session counter
+(define-read-only (get-session-counter)
+    (var-get session-counter))
+
+;; Get current NFT counter
+(define-read-only (get-nft-counter)
+    (var-get nft-counter))
+
+;; Check if contract is paused
+(define-read-only (is-contract-paused)
+    (var-get contract-paused))
+
+;; NFT trait functions
+(define-read-only (get-last-token-id)
+    (ok (var-get nft-counter)))
+
+(define-read-only (get-token-uri (token-id uint))
+    (let ((metadata (map-get? nft-metadata token-id)))
+        (match metadata
+            meta (ok (get metadata-uri meta))
+            (ok none))))
+
+(define-read-only (get-owner (token-id uint))
+    (ok (nft-get-owner? meetproof-nft token-id)))
+
+
+;; private functions
+
+;; Validate location proximity using simplified distance calculation
+(define-private (is-valid-location? 
+                (session-location {lat: int, lon: int}) 
+                (user-location {lat: int, lon: int}) 
+                (radius uint))
+    (let ((lat-diff (abs-value (- (get lat session-location) (get lat user-location))))
+          (lon-diff (abs-value (- (get lon session-location) (get lon user-location))))
+          ;; Simplified distance check (not perfect but sufficient for smart contract)
+          (distance-squared (to-uint (+ (* lat-diff lat-diff) (* lon-diff lon-diff))))
+          (radius-scaled (* radius SCALE-FACTOR)) ;; Convert radius to same scale as coordinates
+          (radius-squared (* radius-scaled radius-scaled)))
+        (<= distance-squared radius-squared)))
+
+;; Try to mint NFT if conditions are met
+(define-private (maybe-mint-nft (session-id uint))
+    (let ((session (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND))
+          (participants (get participants session)))
+        (if (and 
+                (>= (len participants) (get min-participants session))
+                (not (get nft-minted session))
+                (> stacks-block-height (get end-block session))) ;; Auto-mint only after session ends
+            (match (mint-meeting-nft session-id)
+                nft-id (ok true)
+                error (ok true))
+            (ok true))))
+
+;; Mint NFT to a specific participant
+(define-private (mint-to-participant (participant principal) (nft-id-result (response uint uint)))
+    (match nft-id-result
+        nft-id (begin
+            (unwrap! (nft-mint? meetproof-nft nft-id participant) ERR-TRANSFER-FAILED)
+            (ok nft-id))
+        error (err error)))
+
+;; Update participant's session list
+(define-private (update-participant-sessions (participant principal) (session-id uint))
+    (let ((current-sessions (default-to (list) (map-get? participant-sessions participant))))
+        (if (< (len current-sessions) u100)
+            (match (as-max-len? (append current-sessions session-id) u100)
+                new-sessions (begin
+                    (map-set participant-sessions participant new-sessions)
+                    true)
+                false)
+            false))) ;; Silently fail if max sessions reached
+
+;; Absolute value helper
+(define-private (abs-value (value int))
+    (if (< value 0) (- value) value))
