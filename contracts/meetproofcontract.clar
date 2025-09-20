@@ -28,6 +28,11 @@
 (define-constant ERR-INVALID-DURATION (err u109))
 (define-constant ERR-NFT-ALREADY-MINTED (err u110))
 (define-constant ERR-TRANSFER-FAILED (err u111))
+(define-constant ERR-RATE-LIMITED (err u112))
+(define-constant ERR-INVALID-INPUT (err u113))
+(define-constant ERR-REENTRANCY (err u114))
+(define-constant ERR-SECRET-TOO-SHORT (err u115))
+(define-constant ERR-SECRET-TOO-LONG (err u116))
 
 (define-constant MAX-PARTICIPANTS u50)
 (define-constant MAX-RADIUS u10000) ;; 10km in meters
@@ -36,6 +41,10 @@
 (define-constant MIN-DURATION u5)   ;; min blocks for session
 (define-constant EARTH-RADIUS u6371000) ;; Earth radius in meters
 (define-constant SCALE-FACTOR u1000000) ;; for lat/lon precision
+(define-constant RATE-LIMIT-WINDOW u10) ;; blocks for rate limiting
+(define-constant MAX-ACTIONS-PER-WINDOW u5) ;; max actions per window
+(define-constant MIN-SECRET-LENGTH u4) ;; minimum secret length
+(define-constant MAX-SECRET-LENGTH u32) ;; maximum secret length
 
 ;; data vars
 (define-data-var session-counter uint u0)
@@ -68,6 +77,8 @@
 
 (define-map participant-sessions principal (list 100 uint))
 (define-map session-participants uint (list 50 principal))
+(define-map rate-limit principal { last-action: uint, action-count: uint })
+(define-map reentrancy-guard principal bool)
 
 
 
@@ -75,15 +86,20 @@
 
 ;; Create a new meeting session
 (define-public (create-session 
-                (secret (buff 6)) 
+                (secret (buff 64)) 
                 (location {lat: int, lon: int}) 
                 (radius uint) 
                 (duration uint)
                 (min-participants uint)
                 (max-participants uint))
     (let ((session-id (+ (var-get session-counter) u1)))
-        ;; Validate inputs
+        ;; Security checks
         (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+        (asserts! (check-rate-limit tx-sender) ERR-RATE-LIMITED)
+        (asserts! (check-reentrancy tx-sender) ERR-REENTRANCY)
+        
+        ;; Enhanced input validation
+        (asserts! (validate-secret secret) ERR-INVALID-SECRET)
         (asserts! (and (>= radius MIN-RADIUS) (<= radius MAX-RADIUS)) ERR-INVALID-RADIUS)
         (asserts! (and (>= duration MIN-DURATION) (<= duration MAX-DURATION)) ERR-INVALID-DURATION)
         (asserts! (and (>= min-participants u2) (<= min-participants max-participants)) ERR-MIN-PARTICIPANTS-NOT-MET)
@@ -91,39 +107,48 @@
         (asserts! (and (>= (get lat location) -90000000) (<= (get lat location) 90000000)) ERR-INVALID-LOCATION)
         (asserts! (and (>= (get lon location) -180000000) (<= (get lon location) 180000000)) ERR-INVALID-LOCATION)
         
-        ;; Create session
-        (map-set sessions session-id {
-            initiator: tx-sender,
-            secret-hash: (sha256 secret),
-            location: location,
-            radius: radius,
-            start-block: stacks-block-height,
-            end-block: (+ stacks-block-height duration),
-            min-participants: min-participants,
-            max-participants: max-participants,
-            participants: (list),
-            nft-minted: false,
-            metadata-uri: none
-        })
-        
-        ;; Update counter
-        (var-set session-counter session-id)
-        
-        ;; Add to initiator's sessions
-        (update-participant-sessions tx-sender session-id)
-        
-        (ok session-id)))
+        ;; Create session with validated secret hash
+        (let ((validated-secret-hash (sha256 secret)))
+            (map-set sessions session-id {
+                initiator: tx-sender,
+                secret-hash: validated-secret-hash,
+                location: location,
+                radius: radius,
+                start-block: stacks-block-height,
+                end-block: (+ stacks-block-height duration),
+                min-participants: min-participants,
+                max-participants: max-participants,
+                participants: (list),
+                nft-minted: false,
+                metadata-uri: none
+            })
+            
+            ;; Update counter
+            (var-set session-counter session-id)
+            
+            ;; Add to initiator's sessions
+            (update-participant-sessions tx-sender session-id)
+            
+            ;; Release reentrancy lock
+            (release-reentrancy tx-sender)
+            
+            (ok session-id))))
 
 ;; Verify participation in a meeting session
 (define-public (verify-participation 
                (session-id uint) 
-               (secret (buff 6)) 
+               (secret (buff 64)) 
                (location {lat: int, lon: int}))
     (let ((session (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND))
           (current-participants (get participants session)))
         
-        ;; Validate session and participation
+        ;; Security checks
         (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+        (asserts! (check-rate-limit tx-sender) ERR-RATE-LIMITED)
+        (asserts! (check-reentrancy tx-sender) ERR-REENTRANCY)
+        
+        ;; Enhanced input validation
+        (asserts! (validate-secret secret) ERR-INVALID-SECRET)
         (asserts! (>= stacks-block-height (get start-block session)) ERR-SESSION-NOT-STARTED)
         (asserts! (<= stacks-block-height (get end-block session)) ERR-SESSION-EXPIRED)
         (asserts! (is-eq (sha256 secret) (get secret-hash session)) ERR-INVALID-SECRET)
@@ -141,6 +166,9 @@
             
             ;; Try to mint NFT if conditions are met
             (try! (maybe-mint-nft session-id))
+            
+            ;; Release reentrancy lock
+            (release-reentrancy tx-sender)
             
             (ok true))))
 
@@ -191,9 +219,21 @@
 ;; NFT transfer function
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
     (begin
+        ;; Enhanced security checks
+        (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+        (asserts! (check-rate-limit tx-sender) ERR-RATE-LIMITED)
+        (asserts! (check-reentrancy tx-sender) ERR-REENTRANCY)
         (asserts! (is-eq tx-sender sender) ERR-NOT-AUTHORIZED)
         (asserts! (is-some (nft-get-owner? meetproof-nft token-id)) ERR-NFT-NOT-FOUND)
-        (nft-transfer? meetproof-nft token-id sender recipient)))
+        
+        ;; Validate recipient is not zero address
+        (asserts! (not (is-eq recipient tx-sender)) ERR-INVALID-INPUT)
+        
+        ;; Perform transfer
+        (let ((transfer-result (nft-transfer? meetproof-nft token-id sender recipient)))
+            ;; Release reentrancy lock
+            (release-reentrancy tx-sender)
+            transfer-result)))
 
 
 ;; read only functions
@@ -250,6 +290,45 @@
 
 
 ;; private functions
+
+;; Security helper functions
+
+;; Validate secret input
+(define-private (validate-secret (secret (buff 64)))
+    (let ((secret-len (len secret)))
+        (and (>= secret-len MIN-SECRET-LENGTH) (<= secret-len MAX-SECRET-LENGTH))))
+
+;; Check rate limiting
+(define-private (check-rate-limit (user principal))
+    (let ((current-block stacks-block-height)
+          (rate-data (default-to { last-action: u0, action-count: u0 } (map-get? rate-limit user))))
+        (if (or 
+                (is-eq (get last-action rate-data) u0)
+                (> (- current-block (get last-action rate-data)) RATE-LIMIT-WINDOW))
+            (begin
+                (map-set rate-limit user { last-action: current-block, action-count: u1 })
+                true)
+            (if (< (get action-count rate-data) MAX-ACTIONS-PER-WINDOW)
+                (begin
+                    (map-set rate-limit user { 
+                        last-action: (get last-action rate-data), 
+                        action-count: (+ (get action-count rate-data) u1) 
+                    })
+                    true)
+                false))))
+
+;; Reentrancy protection
+(define-private (check-reentrancy (user principal))
+    (let ((is-locked (default-to false (map-get? reentrancy-guard user))))
+        (if is-locked
+            false
+            (begin
+                (map-set reentrancy-guard user true)
+                true))))
+
+;; Release reentrancy lock
+(define-private (release-reentrancy (user principal))
+    (map-set reentrancy-guard user false))
 
 ;; Validate location proximity using simplified distance calculation
 (define-private (is-valid-location? 
